@@ -11,3 +11,4 @@ aiosqlite>=0.19.0
 python-dotenv>=1.0.0
 plyer>=2.1.0
 requests>=2.31.0
+curl_cffi>=0.7.0
