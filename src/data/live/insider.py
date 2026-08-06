@@ -1,5 +1,8 @@
 import asyncio
+import re
 import time
+import httpx
+
 import yfinance as yf
 
 _cache = {}
@@ -166,7 +169,102 @@ async def fetch_insider() -> dict:
 
     await asyncio.to_thread(_fetch)
 
+    # ---- Second source: OpenInsider Form 4 feed (real, live) ----
+    try:
+        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
+            resp = await client.get(
+                "http://openinsider.com/latest-insider-trading",
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+                    )
+                },
+            )
+            if resp.status_code == 200:
+                open_trades = _parse_openinsider(resp.text)
+                # merge, prefer OpenInsider rows (they carry exact dates/prices)
+                existing = {t["detail"]: t for t in all_trades}
+                for t in open_trades:
+                    existing[t["detail"]] = t
+                all_trades = list(existing.values())
+    except Exception:
+        pass
+
+    all_trades.sort(key=lambda t: t.get("date", ""), reverse=True)
     result = {"trades": all_trades[:200], "total": len(all_trades), "updated_at": now}
     result["_ts"] = now
     _cache[cache_key] = result
     return {k: v for k, v in result.items() if k != "_ts"}
+
+
+def _parse_openinsider(html: str) -> list[dict]:
+    """Parse the OpenInsider 'latest insider trading' table into our trade shape.
+
+    Column layout observed (per <td>):
+      0 marker | 1 timestamp(SEC link) | 2 trade date | 3 ticker link | 4 company
+      5 insider | 6 title | 7 trade type | 8 price | 9 shares | 10 value | 11 delta
+    """
+    rows = re.findall(r"<tr[^>]*>(.*?)</tr>", html, re.S)
+    trades = []
+    for row in rows:
+        cells = re.findall(r"<td[^>]*>(.*?)</td>", row, re.S)
+        if len(cells) < 11:
+            continue
+        # ticker lives in a link like href="/GLBE"
+        link = cells[3]
+        m = re.search(r"href=\\?\"?/?([A-Z0-9.\-]{1,8})\\?\"?", link)
+        m = re.search(r"href=\\?\"?/?([A-Z0-9.\-]{1,8})\\?\"?", link) if not m else m
+        if not m:
+            continue
+        ticker = m.group(1).upper()
+        if not re.match(r"^[A-Z0-9.\-]{1,8}$", ticker):
+            continue
+        company = re.sub(r"<[^>]+>", "", cells[4]).strip()
+        insider = re.sub(r"<[^>]+>", "", cells[5]).strip()
+        title = re.sub(r"<[^>]+>", "", cells[6]).strip()
+        ttype_raw = re.sub(r"<[^>]+>", "", cells[7]).strip().upper()
+        price_raw = re.sub(r"[^0-9.]", "", cells[8])
+        qty_raw = re.sub(r"[^0-9.-]", "", cells[9])
+        value_raw = re.sub(r"[^0-9.]", "", cells[10])
+        date_raw = re.sub(r"<[^>]+>", "", cells[2]).strip()
+        try:
+            qty = int(float(qty_raw)) if qty_raw else 0
+        except ValueError:
+            qty = 0
+        try:
+            value = float(value_raw) if value_raw else 0.0
+        except ValueError:
+            value = 0.0
+        try:
+            price = float(price_raw) if price_raw else 0.0
+        except ValueError:
+            price = 0.0
+        if ttype_raw.startswith("P") or "BUY" in ttype_raw:
+            ttype = "buy"
+        elif ttype_raw.startswith("S"):
+            ttype = "sell"
+        elif "GIFT" in ttype_raw or "GRANT" in ttype_raw or "AWARD" in ttype_raw:
+            ttype = "gift"
+        else:
+            ttype = "other"
+        detail = f"{ticker} {insider} {title} {ttype_raw}"
+        trades.append(
+            {
+                "ticker": ticker,
+                "insider": insider,
+                "title": title or company[:40],
+                "trade_type": ttype,
+                "price": price,
+                "shares": abs(qty),
+                "owned": "",
+                "delta_ownership": re.sub(r"<[^>]+>", "", cells[11]).strip()[:10]
+                if len(cells) > 11
+                else "",
+                "value": value,
+                "date": date_raw,
+                "source": "OpenInsider",
+                "detail": detail[:120],
+            }
+        )
+    return trades

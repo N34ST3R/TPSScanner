@@ -9,12 +9,13 @@ from src.delivery.alerts import get_alert_history
 from src.store.config import ACCOUNT_SIZE
 from src.data.live.news import fetch_news
 from src.data.live.social import fetch_social
-from src.data.live.crypto import fetch_crypto
+from src.data.live.crypto import fetch_crypto, fetch_global_stats, fetch_mcap_history
 from src.data.live.calendar import fetch_calendar
 from src.data.live.options_flow import fetch_options_flow
 from src.data.live.insider import fetch_insider
 from src.data.live.analyst import fetch_analyst
 from src.data.live.stock_list import fetch_all_stocks
+from src.data.live import markets as live_markets
 from src.delivery.simulation import (
     execute_buy,
     execute_sell,
@@ -98,6 +99,106 @@ async def scan_ticker(symbol):
         return jsonify({"error": str(e)}), 500
 
 
+_market_cache: dict = {}
+
+
+@app.route("/api/market/overview")
+async def market_overview():
+    """Batched live quotes for the sim watchlist - one request powers the dashboard."""
+    now = time.time()
+    if _market_cache and now - _market_cache["_ts"] < 20:
+        return jsonify(_market_cache["payload"])
+
+    symbols = load_watchlist()[:12]
+    quotes = await asyncio.gather(
+        *[get_current_price(s) for s in symbols], return_exceptions=True
+    )
+    items = []
+    for i, sym in enumerate(symbols):
+        q = quotes[i]
+        if isinstance(q, Exception):
+            q = {"symbol": sym, "price": 0, "change": 0, "change_pct": 0}
+        items.append(
+            {
+                "symbol": q.get("symbol", sym),
+                "price": q.get("price", 0),
+                "change": q.get("change", 0),
+                "change_pct": q.get("change_pct", 0),
+            }
+        )
+    payload = {"items": items, "count": len(items), "updated_at": now}
+    _market_cache.update({"_ts": now, "payload": payload})
+    return jsonify(payload)
+
+
+@app.route("/api/history/<symbol>")
+async def history(symbol):
+    """OHLCV price history for charting."""
+    timeframe = request.args.get("timeframe", "5m")
+    period = request.args.get("period", "5d")
+    try:
+        from src.data.fetcher import fetch_stock
+
+        df = await fetch_stock(symbol.upper(), period=period, interval=timeframe)
+        if df.empty:
+            return jsonify({"symbol": symbol.upper(), "points": []})
+        points = []
+        for _, row in df.iterrows():
+            ts = row["date"]
+            points.append(
+                {
+                    "t": ts.timestamp() if hasattr(ts, "timestamp") else ts,
+                    "o": round(float(row["open"]), 4),
+                    "h": round(float(row["high"]), 4),
+                    "l": round(float(row["low"]), 4),
+                    "c": round(float(row["close"]), 4),
+                    "v": int(row["volume"] or 0),
+                }
+            )
+        return jsonify({"symbol": symbol.upper(), "timeframe": timeframe, "points": points})
+    except Exception as e:
+        return jsonify({"symbol": symbol.upper(), "points": [], "error": str(e)}), 500
+
+
+@app.route("/api/signals/recent")
+async def signals_recent():
+    """Most recent stored signals - one per symbol (latest), so the dashboard shows variety."""
+    limit = max(1, min(request.args.get("limit", 50, type=int), 100))
+    db = await get_db()
+    # Latest id per symbol, then overall newest first.
+    cursor = await db.execute(
+        "SELECT symbol, MAX(id) AS mid FROM signals GROUP BY symbol "
+        "ORDER BY mid DESC LIMIT ?",
+        (min(limit * 3, 200),),
+    )
+    latest = [r["mid"] for r in await cursor.fetchall()][:limit]
+    if not latest:
+        return jsonify([])
+    placeholders = ",".join("?" for _ in latest)
+    cursor = await db.execute(
+        "SELECT symbol, source, score, label, net_direction, patterns, indicators, timeframe, created_at "
+        f"FROM signals WHERE id IN ({placeholders}) ORDER BY id DESC",
+        latest,
+    )
+    rows = await cursor.fetchall()
+    out = []
+    for r in rows:
+        out.append(
+            {
+                "symbol": r["symbol"],
+                "source": r["source"],
+                "score": r["score"],
+                "label": r["label"],
+                "net_direction": r["net_direction"],
+                "patterns": r["patterns"] or "",
+                "indicators": r["indicators"] or "",
+                "timeframe": r["timeframe"],
+                "created_at": r["created_at"],
+            }
+        )
+    return jsonify(out)
+
+
 @app.route("/api/scan/watchlist")
 async def scan_all():
     timeframe = request.args.get("timeframe", "5m")
@@ -107,7 +208,38 @@ async def scan_all():
     symbols = [r[0] for r in rows]
     if not symbols:
         return jsonify([])
-    results = await do_scan_watchlist(symbols, timeframe)
+    # Run under the same lock as the background scanner so concurrent manual
+    # scans never double-fetch Yahoo.
+    from src.main import _scan_lock
+
+    if _scan_lock.locked():
+        return jsonify({"error": "A scan is already running"}), 409
+    import json
+
+    def _jdefault(o):
+        try:
+            return float(o)
+        except (TypeError, ValueError):
+            return str(o)
+
+    async with _scan_lock:
+        results = await do_scan_watchlist(symbols, timeframe)
+        # Persist so the stored-signals dashboard shows variety too.
+        for r in results:
+            await db.execute(
+                "INSERT INTO signals (symbol, source, score, label, net_direction, patterns, indicators, timeframe) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    r["symbol"],
+                    "yahoo",
+                    r["score"],
+                    r["label"],
+                    r["net_direction"],
+                    json.dumps(r.get("patterns", []), default=_jdefault),
+                    json.dumps(r.get("indicators", {}), default=_jdefault),
+                    r.get("timeframe", "5m"),
+                ),
+            )
+        await db.commit()
     return jsonify(results)
 
 
@@ -183,6 +315,23 @@ async def live_crypto():
         return jsonify({"coins": [], "error": str(e)})
 
 
+@app.route("/api/live/crypto/global")
+async def live_crypto_global():
+    try:
+        return jsonify(await fetch_global_stats())
+    except Exception as e:
+        return jsonify({"total_market_cap": 0, "error": str(e)})
+
+
+@app.route("/api/live/crypto/mcap")
+async def live_crypto_mcap():
+    days = request.args.get("days", 30, type=int)
+    try:
+        return jsonify(await fetch_mcap_history(days))
+    except Exception as e:
+        return jsonify({"points": [], "error": str(e)})
+
+
 @app.route("/api/live/calendar")
 async def live_calendar():
     try:
@@ -221,6 +370,46 @@ async def live_stocks():
         return jsonify(await fetch_all_stocks())
     except Exception as e:
         return jsonify({"stocks": [], "error": str(e)})
+
+
+@app.route("/api/live/indices")
+async def live_indices():
+    try:
+        return jsonify(await live_markets.fetch_indices())
+    except Exception as e:
+        return jsonify({"items": [], "error": str(e)})
+
+
+@app.route("/api/live/commodities")
+async def live_commodities():
+    try:
+        return jsonify(await live_markets.fetch_commodities())
+    except Exception as e:
+        return jsonify({"items": [], "error": str(e)})
+
+
+@app.route("/api/live/forex")
+async def live_forex():
+    try:
+        return jsonify(await live_markets.fetch_forex())
+    except Exception as e:
+        return jsonify({"items": [], "error": str(e)})
+
+
+@app.route("/api/live/movers")
+async def live_movers():
+    try:
+        return jsonify(await live_markets.fetch_movers())
+    except Exception as e:
+        return jsonify({"gainers": [], "losers": [], "most_active": [], "error": str(e)})
+
+
+@app.route("/api/live/fear-greed")
+async def live_fear_greed():
+    try:
+        return jsonify(await live_markets.fetch_fear_greed())
+    except Exception as e:
+        return jsonify({"score": 0, "rating": "Unknown", "error": str(e)})
 
 
 @app.route("/api/simulation/portfolio")
@@ -353,3 +542,149 @@ async def alerts_check():
         return jsonify({"alerts": alerts, "count": len(alerts)})
     except Exception as e:
         return jsonify({"alerts": [], "count": 0, "error": str(e)})
+
+
+# --- Top Traders API ---
+import json as json_mod
+from pathlib import Path as PathMod
+from src.toptraders import store as tt_store
+from src.toptraders import leaderboard as tt_leaderboard
+from src.toptraders import copytrader as tt_copytrader
+
+
+async def _load_leaderboard():
+    if tt_leaderboard.LEADERBOARD_PATH.exists():
+        try:
+            return json_mod.loads(tt_leaderboard.LEADERBOARD_PATH.read_text())
+        except Exception:
+            pass
+    return await tt_leaderboard.rebuild_leaderboard()
+
+
+@app.route("/api/toptraders/accounts")
+async def toptraders_accounts():
+    """Every trader currently tracked by the engine (pre-eligibility)."""
+    try:
+        rows = await tt_store.list_accounts()
+        out = []
+        for a in rows:
+            out.append(
+                {
+                    "handle": a["handle"],
+                    "display_name": a["display_name"],
+                    "source": a["source"],
+                    "copy_enabled": bool(a["copy_enabled"]),
+                }
+            )
+        return jsonify({"accounts": out, "count": len(out)})
+    except Exception as e:
+        return jsonify({"accounts": [], "count": 0, "error": str(e)})
+
+
+@app.route("/api/toptraders/leaderboard")
+async def toptraders_leaderboard():
+    try:
+        return jsonify(await _load_leaderboard())
+    except Exception as e:
+        return jsonify({"traders": [], "error": str(e)})
+
+
+@app.route("/api/toptraders/picks")
+async def toptraders_picks():
+    try:
+        calls = await tt_store.list_open_calls()
+        wr_by_handle = {}
+        try:
+            for t in await tt_leaderboard.compute_win_rate(5):
+                wr_by_handle[t["handle"]] = t["win_rate"]
+        except Exception:
+            pass
+        picks = []
+        for c in calls:
+            price_data = {}
+            try:
+                from src.delivery.simulation import get_current_price
+
+                price_data = await get_current_price(c["symbol"])
+            except Exception:
+                pass
+            price = price_data.get("price") or 0
+            entry = c["entry_price"] or 0
+            unrealized = (price - entry) / entry * 100 if entry and price else 0.0
+            picks.append(
+                {
+                    "id": c["id"],
+                    "symbol": c["symbol"],
+                    "direction": c["direction"],
+                    "entry_price": entry,
+                    "handle": c["handle"],
+                    "display_name": c["display_name"],
+                    "source": c["source"],
+                    "win_rate": wr_by_handle.get(c["handle"]),
+                    "unrealized_pct": round(unrealized, 2),
+                }
+            )
+        return jsonify({"picks": picks})
+    except Exception as e:
+        return jsonify({"picks": [], "error": str(e)})
+
+
+@app.route("/api/toptraders/copy")
+async def toptraders_copy():
+    try:
+        return jsonify(await tt_copytrader.get_copy_summary())
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+@app.route("/api/toptraders/copy/<int:call_id>", methods=["POST"])
+async def toptraders_copy_call(call_id):
+    try:
+        body = await request.get_json(silent=True) or {}
+        wr = float(body.get("wr", 0.75))
+        return jsonify(await tt_copytrader.copy_call(call_id, wr))
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)})
+
+
+@app.route("/api/toptraders/accounts/<handle>/toggle", methods=["POST"])
+async def toptraders_toggle(handle):
+    try:
+        acc = await tt_store.get_account(handle)
+        if acc is None:
+            return jsonify({"error": "Account not found"}), 404
+        new_state = 0 if acc["copy_enabled"] else 1
+        await tt_store.set_copy_enabled(handle, bool(new_state))
+        return jsonify({"handle": handle, "copy_enabled": new_state})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+
+_tt_collect_state = {"running": False, "last": None, "error": None}
+
+
+async def _run_collect():
+    from src.toptraders import collector as tt_collector
+
+    _tt_collect_state["running"] = True
+    try:
+        _tt_collect_state["last"] = await tt_collector.collect_all()
+        _tt_collect_state["error"] = None
+    except Exception as e:
+        _tt_collect_state["error"] = str(e)
+    finally:
+        _tt_collect_state["running"] = False
+
+
+@app.route("/api/toptraders/collect", methods=["POST"])
+async def toptraders_collect_now():
+    """Start a background collection from StockTwits / TradingView / Polymarket."""
+    if _tt_collect_state["running"]:
+        return jsonify({"running": True, "message": "Collection already in progress"})
+    asyncio.create_task(_run_collect())
+    return jsonify({"started": True, "message": "Collection started — takes about a minute"})
+
+
+@app.route("/api/toptraders/collect/status")
+async def toptraders_collect_status():
+    return jsonify(_tt_collect_state)

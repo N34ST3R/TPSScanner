@@ -17,3 +17,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
 SCRAPE_URLS = [u.strip() for u in os.getenv("SCRAPE_URLS", "").split(",") if u.strip()]
 
 DB_PATH = Path(__file__).parent.parent.parent / "data" / "scanner.db"
+
+TOP_TRADERS_MIN_CALLS = int(os.getenv("TOP_TRADERS_MIN_CALLS", "10"))
+TOP_TRADERS_MIN_PNL = float(os.getenv("TOP_TRADERS_MIN_PNL", "1000"))
+TOP_TRADERS_MAX_CAP = float(os.getenv("TOP_TRADERS_MAX_CAP", "5000"))

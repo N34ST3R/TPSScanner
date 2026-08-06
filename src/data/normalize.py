@@ -2,8 +2,12 @@ import pandas as pd
 
 
 def normalize_ohlcv(df: pd.DataFrame, symbol: str, source: str) -> pd.DataFrame:
+    # yfinance returns timestamps as the DataFrame index - hoist it into a column.
+    if "date" not in df.columns and isinstance(df.index, pd.DatetimeIndex):
+        df = df.reset_index()
     col_map = {
         "Date": "date",
+        "Datetime": "date",
         "Open": "open",
         "High": "high",
         "Low": "low",
@@ -25,8 +29,14 @@ def normalize_ohlcv(df: pd.DataFrame, symbol: str, source: str) -> pd.DataFrame:
     df["source"] = source
     if not pd.api.types.is_datetime64_any_dtype(df["date"]):
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    # Drop timezone info so comparisons and epoch conversions stay consistent.
+    if getattr(df["date"].dt, "tz", None) is not None:
+        df["date"] = df["date"].dt.tz_localize(None)
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
+    # yfinance occasionally appends a junk row whose date fails to parse and
+    # lands on the epoch (1970). Drop anything before the modern era outright.
+    df = df[df["date"] > pd.Timestamp("1975-01-01")]
     return df[required + ["symbol", "source"]].dropna(subset=["close"])
 
 

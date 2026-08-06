@@ -1,7 +1,34 @@
 import asyncio
+import re
 import time
 import httpx
 from xml.etree import ElementTree
+
+# Common US-listed tickers + crypto symbols we scan headlines for.
+# Tickers we scan headlines for. NOTE: matching is case-sensitive on uppercase
+# tokens only, so common words (now, net, car, flow, ai, c, u) never false-match.
+TICKER_PATTERNS = re.compile(
+    r"\b(AAPL|MSFT|NVDA|TSLA|AMZN|META|GOOGL|GOOG|NFLX|AMD|INTC|AVGO|ORCL|ADBE|CRM|CSCO|"
+    r"QCOM|MU|PLTR|SNOW|UBER|SHOP|BA|XOM|CVX|CAT|GE|F|GM|JPM|GS|MS|BAC|WFC|C|DIS|NKE|"
+    r"SBUX|MCD|WMT|PG|KO|PEP|JNJ|PFE|MRK|UNH|LLY|ABBV|DOW|APP|AFRM|COIN|HOOD|SOFI|RIVN|"
+    r"LCID|TWLO|NET|DDOG|MDB|ZS|OKTA|DOCU|ZM|TEAM|WDAY|NOW|SNOW|PANW|CRWD|FTNT|MRVL|"
+    r"TXN|ADI|NXPI|STX|WDC|SMCI|DELL|HPQ|HPE|IBM|T|VZ|TMUS|ATVI|EA|TTWO|UBER|LYFT|ABNB|"
+    r"BKNG|EXPE|MAR|HLT|CCL|RCL|NCLH|DAL|UAL|AAL|LUV|JBLU|ALK|CAR|HTZ|XPEV|NIO|LI|BYDDY|"
+    r"JD|BABA|PDD|BIDU|TCEHY|SE|GRAB|SHOP|ETSY|EBAY|MELI|SEA|DOCS|PATH|U|RBLX|C3|AI|"
+    r"BTC|ETH|SOL|XRP|DOGE|BNB|ADA|DOT|AVAX|LINK|MATIC|LTC|UNI|SHIB|XMR|ETC|APT|ARB|OP|"
+    r"SUI|SEI|INJ|TIA|PEPE|WIF|BONK|ORDI|RUNE|STX|HBAR|ALGO|NEAR|FIL|ATOM|XTZ|EGLD|FTM|"
+    r"GALA|IMX|SAND|MANA|AXS|ENJ|CHZ|FLOW|ICP|MINA|ZEC|DASH|KSM|DOT|GLM)\b",
+)
+# Uppercase-only noise tokens that are valid tickers but too common as words.
+_TICKER_NOISE = {"C", "U", "AI", "MS", "OP", "SE", "F", "GE", "LI", "T", "BA"}
+
+
+def extract_tickers(title: str) -> list[str]:
+    """Tickers mentioned in a headline - only matches real uppercase ticker tokens."""
+    if not title:
+        return []
+    found = TICKER_PATTERNS.findall(title)
+    return sorted({t for t in found if t not in _TICKER_NOISE})
 
 _cache = {}
 _cache_ttl = {}
@@ -30,6 +57,28 @@ NEWS_FEEDS = {
 }
 
 
+MEDIA_NS = "{http://search.yahoo.com/mrss/}"
+
+
+def _extract_image(item) -> str:
+    """Best-effort thumbnail from enclosure, media:content/thumbnail, or description img."""
+    for enc in item.findall("enclosure"):
+        if (enc.get("type") or "").startswith("image"):
+            return enc.get("url", "")
+    for tag in (f"{MEDIA_NS}content", f"{MEDIA_NS}thumbnail"):
+        node = item.find(tag)
+        if node is not None and node.get("url"):
+            return node.get("url", "")
+    desc = item.findtext("description", "")
+    if desc:
+        import re
+
+        m = re.search(r'<img[^>]+src=["\']([^"\']+)["\']', desc)
+        if m:
+            return m.group(1)
+    return ""
+
+
 def _parse_rss(xml_text: str, source: str) -> list[dict]:
     articles = []
     try:
@@ -47,11 +96,110 @@ def _parse_rss(xml_text: str, source: str) -> list[dict]:
                         "url": link.strip() if link else "",
                         "published": pub_date.strip() if pub_date else "",
                         "summary": description.strip()[:200] if description else "",
+                        "image": _extract_image(item),
                     }
                 )
     except ElementTree.ParseError:
         pass
     return articles
+
+
+def _normalize_title(title: str) -> str:
+    """Lowercase, strip punctuation/stopwords and digits for near-duplicate matching."""
+    t = re.sub(r"[^a-z0-9 ]", " ", title.lower())
+    words = [
+        w
+        for w in t.split()
+        if w
+        not in {
+            "the",
+            "a",
+            "an",
+            "to",
+            "of",
+            "in",
+            "on",
+            "for",
+            "with",
+            "and",
+            "or",
+            "as",
+            "at",
+            "by",
+            "from",
+            "is",
+            "are",
+            "was",
+            "will",
+            "its",
+            "it",
+            "s",
+            "t",
+            "after",
+            "before",
+            "into",
+            "over",
+            "under",
+            "vs",
+        }
+    ]
+    return " ".join(words)
+
+
+def cluster_articles(articles: list[dict]) -> list[dict]:
+    """Group the same story covered by multiple sources.
+
+    Uses token-set Jaccard similarity on normalized titles; returns clusters
+    sorted by heat (number of distinct sources).
+    """
+    if not articles:
+        return []
+    normalized = [(a, _normalize_title(a.get("title", "")).split()) for a in articles]
+
+    clusters: list[list] = []
+    for art, toks in normalized:
+        if not toks:
+            continue
+        tok_set = set(toks)
+        best = None
+        best_score = 0.0
+        for ci, cluster in enumerate(clusters):
+            c_toks = cluster[0]["_toks"]
+            inter = len(tok_set & c_toks)
+            union = len(tok_set | c_toks)
+            score = inter / union if union else 0
+            # require a strong overlap and share at least one real token
+            if score > best_score and score >= 0.55 and inter >= 2:
+                best = ci
+                best_score = score
+        if best is None:
+            clusters.append([{"_toks": tok_set, **art}])
+        else:
+            clusters[best].append({"_toks": tok_set, **art})
+
+    out = []
+    for cluster in clusters:
+        cluster.sort(key=lambda a: a.get("published", ""), reverse=True)
+        lead = cluster[0]
+        sources = sorted({a.get("source", "") for a in cluster})
+        tickers = set()
+        for a in cluster:
+            tickers.update(extract_tickers(a.get("title", "") or ""))
+        out.append(
+            {
+                "title": lead.get("title", ""),
+                "url": lead.get("url", ""),
+                "image": lead.get("image", ""),
+                "published": lead.get("published", ""),
+                "sentiment": lead.get("sentiment", "neutral"),
+                "heat": len(sources),
+                "sources": sources,
+                "tickers": sorted(tickers),
+                "article_count": len(cluster),
+            }
+        )
+    out.sort(key=lambda c: (c["heat"], c["article_count"]), reverse=True)
+    return out
 
 
 def _sentiment_from_headline(title: str) -> str:
@@ -132,6 +280,7 @@ async def fetch_news() -> dict:
 
     for a in all_articles:
         a["sentiment"] = _sentiment_from_headline(a["title"])
+        a["tickers"] = extract_tickers(a.get("title", "") or "")
 
     seen_titles = set()
     unique = []
@@ -147,6 +296,7 @@ async def fetch_news() -> dict:
         "articles": unique[:100],
         "total": len(unique),
         "sources": list(NEWS_FEEDS.keys()),
+        "trending": cluster_articles(unique)[:8],
         "updated_at": now,
     }
     result["_ts"] = now
