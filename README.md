@@ -6,6 +6,10 @@ rule-based pattern engine.
 
 > **Not a broker.** The platform scans, ranks and simulates; it never places real orders.
 
+
+
+<img width="2558" height="1425" alt="image" src="https://github.com/user-attachments/assets/ed1f7332-3fa5-4a46-a7e9-a9ee5ecbcdb3" />
+
 ---
 
 ## What it does
